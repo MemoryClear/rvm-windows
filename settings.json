@@ -1,0 +1,6 @@
+{
+    "root": "%USERPROFILE%\\.rvm",
+    "rustup_dist_server": null,
+    "rustup_update_root": null,
+    "cargo_mirror_name": "official"
+}
