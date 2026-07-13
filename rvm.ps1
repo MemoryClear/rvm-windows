@@ -232,6 +232,14 @@ function Clear-RustupCache {
             Write-Color "  Cleared tmp/ ($count temp dirs)" "Gray"
         } catch { }
     }
+    # downloads — stale partial downloads from failed mirror attempts
+    $downloadsDir = Join-Path $script:RUSTUP_HOME_DIR "downloads"
+    if (Test-Path $downloadsDir) {
+        try {
+            Get-ChildItem $downloadsDir -File -Filter "*.partial" | ForEach-Object { Remove-Item $_.FullName -Force; $count++ }
+            Write-Color "  Cleared downloads/*.partial" "Gray"
+        } catch { }
+    }
     # update-hashes — rustup recreates these on next use
     $hashDir = Join-Path $script:RUSTUP_HOME_DIR "update-hashes"
     if (Test-Path $hashDir) {
@@ -372,40 +380,49 @@ function Invoke-RvmInstall {
             $sourceName = if ($UseMirror) { $mirrorName } else { "official" }
             Write-Host "Installing toolchain '$Toolchain' via rustup (source: $sourceName)..." -ForegroundColor White
             
+            # Save current env vars
+            $oldDist = $env:RUSTUP_DIST_SERVER
+            $oldRoot = $env:RUSTUP_UPDATE_ROOT
+            $oldRustupHome = $env:RUSTUP_HOME
+            $oldCargoHome = $env:CARGO_HOME
+            
+            # Set env vars for rustup
+            $env:RUSTUP_HOME = $script:RUSTUP_HOME_DIR
+            $env:CARGO_HOME = $script:CARGO_HOME_DIR
             if ($UseMirror) {
-                $output = Invoke-WithRustupEnv {
-                    $out = & (Get-RustupExePath) toolchain install $Toolchain 2>&1
-                    if ($out) { Write-Host "$out" }
-                    if ($LASTEXITCODE -eq 0) { return $true } else { return $false }
-                }
+                $settings = Get-Settings
+                $env:RUSTUP_DIST_SERVER = if ($settings.rustup_dist_server) { $settings.rustup_dist_server } else { $null }
+                $env:RUSTUP_UPDATE_ROOT = if ($settings.rustup_update_root) { $settings.rustup_update_root } else { $null }
             } else {
-                # Install from official source - temporarily clear mirror env vars
-                $oldDist = $env:RUSTUP_DIST_SERVER
-                $oldRoot = $env:RUSTUP_UPDATE_ROOT
                 $env:RUSTUP_DIST_SERVER = $null
                 $env:RUSTUP_UPDATE_ROOT = $null
-                try {
-                    $out = & $rustupExe toolchain install $Toolchain 2>&1
-                    if ($out) { Write-Host "$out" }
-                    if ($LASTEXITCODE -eq 0) { $output = $true } else { $output = $false }
-                } finally {
-                    $env:RUSTUP_DIST_SERVER = $oldDist
-                    $env:RUSTUP_UPDATE_ROOT = $oldRoot
-                }
             }
             
-            if ($output) { return $true }
-            # Check if it's a metadata error
-            $outputStr = "$output"
-            if ($outputStr -match 'metadata is out of date|TOML parse error|could not parse settings') {
-                return "METADATA_ERROR"
+            try {
+                # Directly call rustup and capture output
+                $out = & $rustupExe toolchain install $Toolchain 2>&1
+                $outStr = "$out"
+                if ($out) { Write-Host $outStr }
+                
+                if ($LASTEXITCODE -eq 0) { return $true }
+                
+                # Check if it's a metadata error
+                if ($outStr -match 'metadata is out of date|TOML parse error|could not parse settings') {
+                    return "METADATA_ERROR"
+                }
+                # Check if it's a 404 error (version not available on mirror)
+                if ($UseMirror -and $outStr -match '404|not found|nonexistent') {
+                    return "MIRROR_404"
+                }
+                Write-Color "Install failed (exit $LASTEXITCODE)" "Red"
+                return $false
+            } finally {
+                # Restore env vars
+                $env:RUSTUP_DIST_SERVER = $oldDist
+                $env:RUSTUP_UPDATE_ROOT = $oldRoot
+                $env:RUSTUP_HOME = $oldRustupHome
+                $env:CARGO_HOME = $oldCargoHome
             }
-            # Check if it's a 404 error (version not available on mirror)
-            if ($UseMirror -and $outputStr -match '404|not found|nonexistent') {
-                return "MIRROR_404"
-            }
-            Write-Color "Install failed (exit $LASTEXITCODE)" "Red"
-            return $false
         } else {
             # First-time setup: run rustup-init WITHOUT mirror env vars.
             # rustup-init.exe respects RUSTUP_DIST_SERVER, and mirrors do NOT
