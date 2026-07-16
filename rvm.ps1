@@ -662,13 +662,26 @@ function Test-MirrorSpeed {
         $sw = [Diagnostics.Stopwatch]::StartNew()
         $ok = $false; $err = $null
         try {
-            $out = & $rustup check 2>&1
-            $errOut = $out | Where-Object { $_ -match 'error[:]|404|timeout|reset|failed' -and $_ -notmatch 'update available|up to date' }
-            $okOut  = $out | Where-Object { $_ -match 'stable|beta|nightly|up.to.date|update available' }
-            if ($errOut -and -not $okOut) { $err = ($errOut[0] -split ':', 2)[-1].Trim() }
-            else { $ok = $true }
-        } catch { $err = $_.Exception.Message.Split(
-)[0].Trim() }
+            # Run rustup check in a background job so we can apply a 10-second timeout.
+            # Without a timeout, a dead mirror hangs indefinitely.
+            $job = Start-Job -ScriptBlock {
+                param($R) & $R check 2>&1
+            } -ArgumentList $rustup
+
+            $completed = Wait-Job $job -Timeout 10
+            if ($completed) {
+                $out = Receive-Job $job -ErrorAction SilentlyContinue
+                Remove-Job $job -Force
+                $errOut = $out | Where-Object { $_ -match 'error[:]|404|timeout|reset|failed' -and $_ -notmatch 'update available|up to date' }
+                $okOut  = $out | Where-Object { $_ -match 'stable|beta|nightly|up.to.date|update available' }
+                if ($errOut -and -not $okOut) { $err = ($errOut[0] -split ':', 2)[-1].Trim() }
+                else { $ok = $true }
+            } else {
+                Stop-Job $job -ErrorAction SilentlyContinue
+                Remove-Job $job -Force
+                $err = "timeout (10s)"
+            }
+        } catch { $err = $_.Exception.Message.Split("`n")[0].Trim() }
         $ms = $sw.ElapsedMilliseconds; $sw.Stop()
         return @{ name=$Name; ok=$ok; ms=$ms; error=$err }
     } finally {
