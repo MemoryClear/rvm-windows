@@ -15,6 +15,8 @@ param(
     $script:REMAINING_ARGS = @($RemainingArgs)
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+# Ensure $LASTEXITCODE is always numeric to avoid StrictMode errors.
+$LASTEXITCODE = 0
 $script:RVM_VERSION = "0.1.0"
 $script:DEFAULT_RVM_HOME = Join-Path $env:USERPROFILE ".rvm"
 $script:RUSTUP_INIT_BASE = "https://static.rust-lang.org/rustup/dist"
@@ -380,6 +382,12 @@ function Invoke-RvmInstall {
             $sourceName = if ($UseMirror) { $mirrorName } else { "official" }
             Write-Host "Installing toolchain '$Toolchain' via rustup (source: $sourceName)..." -ForegroundColor White
             
+            # Skip rustup self-update check: we only care about installing toolchains.
+            # Without this, rustup runs rustup-init internally for self-update, and if
+            # the mirror can't reach the update server, it exits 1 (polluting $LASTEXITCODE)
+            # even though the toolchain install itself succeeded.
+            $env:RUSTUP_TOOLCHAIN = $Toolchain
+
             # Save current env vars
             $oldDist = $env:RUSTUP_DIST_SERVER
             $oldRoot = $env:RUSTUP_UPDATE_ROOT
@@ -397,24 +405,29 @@ function Invoke-RvmInstall {
                 $env:RUSTUP_DIST_SERVER = $null
                 $env:RUSTUP_UPDATE_ROOT = $null
             }
-            
             try {
-                # Directly call rustup and capture output
-                $out = & $rustupExe toolchain install $Toolchain 2>&1
-                $outStr = "$out"
-                if ($out) { Write-Host $outStr }
+                # Directly call rustup and capture output.
+                $raw = & $rustupExe toolchain install $Toolchain 2>&1
+                $rc = $LASTEXITCODE
+                $outStr = "$raw"
+                if ($raw) { Write-Host $outStr }
+
                 
-                if ($LASTEXITCODE -eq 0) { return $true }
-                
-                # Check if it's a metadata error
-                if ($outStr -match 'metadata is out of date|TOML parse error|could not parse settings') {
-                    return "METADATA_ERROR"
+                # Even if rustup exits non-zero, the install may have succeeded.
+                if ($rc -eq 0 -or $outStr -match 'unchanged|installed|running [\d\.]+') {
+                    return $true
                 }
-                # Check if it's a 404 error (version not available on mirror)
-                if ($UseMirror -and $outStr -match '404|not found|nonexistent') {
+                # ---- Determine failure type ----
+                if ($UseMirror -and $outStr -match '404|not found|nonexistent|\bno targets?\b|invalid target|target.+.not.found') {
                     return "MIRROR_404"
                 }
-                Write-Color "Install failed (exit $LASTEXITCODE)" "Red"
+                if ($outStr -match 'obsolete.*manifest|metadata is out of date|TOML parse error|could not parse settings') {
+                    return "METADATA_ERROR"
+                }
+                if ($UseMirror) {
+                    return "MIRROR_404"
+                }
+                Write-Color "Install failed (exit $rc)" "Red"
                 return $false
             } finally {
                 # Restore env vars
@@ -433,20 +446,32 @@ function Invoke-RvmInstall {
                 & (Get-RustupInitExePath) -y --no-modify-path --default-toolchain $Toolchain 2>&1
             }
             if ($output) { Write-Host "$output" }
-            if ($LASTEXITCODE -eq 0) { return $true }
-            Write-Color "rustup-init failed (exit $LASTEXITCODE)" "Red"
+            $rc = $LASTEXITCODE
+            # rustup-init may exit 1 from its self-update check (network/mirror unreachable)
+            # even though the toolchain itself installed successfully. Detect success by output.
+            $outStr = "$output"
+            if ($rc -eq 0 -or $outStr -match 'installed|success|is already installed') {
+                return $true
+            }
+            Write-Color "rustup-init failed (exit $rc)" "Red"
             return $false
         }
     }
     $result = _DoInstall
-    if ($result -eq "METADATA_ERROR") {
+    if ("METADATA_ERROR" -eq $result) {
         Write-Host ""
         Write-Color "⚠ Rustup metadata is corrupted (common after switching mirrors)." "Yellow"
         Write-Color "  Auto-clearing cache and retrying..." "Yellow"
         Clear-RustupCache
         $result = _DoInstall
+        # If retry still fails (mirror has no target or obsolete metadata), fall back to official.
+        if ($true -ne $result) {
+            Write-Host ""
+            Write-Color "⚠ Mirror metadata still unavailable. Falling back to official source..." "Yellow"
+            $result = _DoInstall -UseMirror:$false
+        }
     }
-    if ($result -eq "MIRROR_404") {
+    if ("MIRROR_404" -eq $result) {
         Write-Host ""
         Write-Color "⚠ Version '$Toolchain' not available on mirror '$mirrorName'." "Yellow"
         Write-Color "  Falling back to official source..." "Yellow"
@@ -457,10 +482,9 @@ function Invoke-RvmInstall {
         if ((Get-RustupExePath) -and -not (Get-CurrentToolchain)) {
             Invoke-RvmUse $Toolchain
         }
-    } elseif ($result -eq $false -or $result -eq "METADATA_ERROR") {
+    } else {
         Write-Host ""
-        Write-Color "Install still failed after cache clear." "Red"
-        Write-Color "Try: rvm repair  (full re-initialize, preserves toolchains)" "Yellow"
+        Write-Color "Install failed. Try: rvm repair" "Red"
     }
 }
 function Invoke-RvmUse {
